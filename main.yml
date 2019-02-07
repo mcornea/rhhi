@@ -72,7 +72,17 @@
                 repo: https://github.com/openshift/installer.git
                 dest: /opt/go/src/github.com/openshift/installer
         when: not godir.stat.exists 
+      - name: check for system-wide installed golang
+        yum:
+          list: golang
+        register: golang_package
 
+      - name: delete system-wide golang
+        yum:
+          name: golang
+          state: removed
+        when: golang_package.results | selectattr("yumstate", "match", "installed") | list | length != 0
+        
       - name: build dependencies
         shell: |
             export GOPATH=/opt/go
