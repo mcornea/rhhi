@@ -1,0 +1,7 @@
+{{ bootstrapaddr.stdout }} rhhi-api.redhat.local
+{% for host_string in nodes_info.results|map(attribute='stdout')|list %}
+{% set host_data = host_string|from_yaml %}
+172.22.0.2{{ host_data.name.split('-')[2] }} rhhi-etcd-{{ host_data.name.split('-')[2] }}.redhat.local rhhi-api.redhat.local
+{% endfor %}
+
+

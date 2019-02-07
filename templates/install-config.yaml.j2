@@ -1,0 +1,27 @@
+apiVersion: v1beta1
+baseDomain: redhat.local
+machines:
+- name: master
+  platform: {}
+  replicas: 1
+- name: worker
+  platform: {}
+  replicas: 3
+metadata:
+  creationTimestamp: null
+  name: rhhi
+networking:
+  clusterNetworks:
+  - cidr: 10.128.0.0/14
+    hostSubnetLength: 9
+  machineCIDR: 10.0.0.0/24
+  serviceCIDR: 172.30.0.0/16
+  type: OpenshiftSDN
+platform:
+  libvirt:
+    URI: qemu+tcp://192.168.122.1/system
+    network:
+      if: management
+pullSecret: '{{ install.pullsecret }}'
+sshKey: |
+  {{ pubkey.stdout }}

@@ -1,0 +1,402 @@
+---
+- name: Allow vbmc ports for all the overcloud nodes
+  hosts: hypervisor                                       
+  any_errors_fatal: true                                                       
+  tasks:
+      - name: Get overcloud nodes
+        set_fact:
+          oc_nodes: "{{ groups.get('overcloud_nodes', []) }}"
+
+      - include_role:
+            name: vbmc
+        vars:
+            vbmc_nodes: "{{ oc_nodes }}"
+
+      - name: setup vbmc access for all the available overcloud nodes
+        include_role:
+            name: vbmc
+            tasks_from: iptables_overcloud.yml
+
+      - name: get information about vm's from hypervisor
+        vars:
+            vm_nodes: "{{ oc_nodes }}"
+        delegate_to: hypervisor
+        shell: |
+            NODE_XML=`virsh dumpxml {{ item }}`
+            disks_list="["
+            for dsk in $(virsh domblklist {{ item }} | tail -n +3 | awk '{print $1}'); do
+                disks_list="${disks_list}\"${dsk}\","
+            done
+            disks_list="${disks_list}]"
+            disks_list="$(echo ${disks_list} | sed 's/,]/]/g')"
+
+            echo "{
+                'name': '{{ item }}',
+                'arch': '`echo "$NODE_XML" | grep arch | cut -d\' -f2`',
+                'memory_kibs': '`echo "$NODE_XML" | grep currentMemory | cut -d\< -f2 | cut -d\> -f2`',
+                'mac': '`echo "$NODE_XML" | grep data -B 1 | grep mac | cut -d\' -f2`',
+                'cpu': '`echo "$NODE_XML" | grep vcpu | cut -d\< -f2 | cut -d\> -f2`',
+                'disk_bytes': '`virsh domblkinfo {{ item }} vda | grep -e Capacity | cut -d\: -f2 | xargs`',
+                'disks': '${disks_list}',
+            }"
+        with_items: "{{ vm_nodes|sort }}"
+        register: nodes_info
+        tags:
+            - skip_ansible_lint
+
+      - name: generate nodes.json file
+        delegate_to: rhhi-client-0
+        template:
+            src: nodes.json.j2
+            dest: /root/nodes.json
+
+      - name: check if coreos image was downloaded
+        stat: 
+          path: /opt/go/
+        register: godir
+
+      - block:
+          - name: download golang
+            shell: |
+                curl -o /opt/go.tar.gz https://dl.google.com/go/go1.10.8.linux-amd64.tar.gz
+                tar xvf go.tar.gz
+            args:
+                chdir: /opt/
+
+          - file:
+                path: /opt/go/src/github.com/openshift/installer
+                state: directory
+
+          - name: download openshift installer
+            git:
+                repo: https://github.com/openshift/installer.git
+                dest: /opt/go/src/github.com/openshift/installer
+        when: not godir.stat.exists 
+
+      - name: build dependencies
+        shell: |
+            export GOPATH=/opt/go
+            export PATH=$PATH:${GOPATH//://bin:}/bin
+            TAGS=libvirt hack/build.sh
+        args:
+            chdir: /opt/go/src/github.com/openshift/installer
+
+      - file:
+            path: /opt/go/src/github.com/openshift/installer/rhhi
+            state: absent
+
+      - file:
+            path: /opt/go/src/github.com/openshift/installer/rhhi
+            state: directory
+
+      - name: register public ssh key
+        command: cat /root/.ssh/id_rsa.pub
+        register: pubkey
+
+      - name: generate install-config
+        template:
+            src: install-config.yaml.j2
+            dest: /opt/go/src/github.com/openshift/installer/rhhi/install-config.yaml
+
+      - name: generate ignition configs
+        shell: |
+            export GOPATH=/opt/go
+            export PATH=$PATH:${GOPATH//://bin:}/bin
+            bin/openshift-install --dir rhhi --log-level=debug create ignition-configs
+        args:
+            chdir: /opt/go/src/github.com/openshift/installer
+
+      - name: copy bootstrap ignition config
+        copy: 
+          src: /opt/go/src/github.com/openshift/installer/rhhi/bootstrap.ign
+          dest: /var/lib/libvirt/images/bootstrap.ign
+          remote_src: true
+
+      - name: check if coreos image was downloaded
+        stat: 
+          path: /var/lib/libvirt/images/redhat-coreos-maipo-47.284-qemu.qcow2
+        register: coreosimage
+
+      - name: download coreos image
+        shell: |
+          curl --insecure --compressed -L \
+          -o /var/lib/libvirt/images/redhat-coreos-maipo-47.284-qemu.qcow2 \
+          https://releases-redhat-coreos-dev.cloud.paas.upshift.redhat.com/storage/releases/maipo/47.284/redhat-coreos-maipo-47.284-qemu.qcow2.gz
+        when: not coreosimage.stat.exists 
+
+      - name: copy bootstrap vm disk file
+        copy: 
+          src: /var/lib/libvirt/images/redhat-coreos-maipo-47.284-qemu.qcow2
+          dest: /var/lib/libvirt/images/rhhi-bootstrap-0-disk1.qcow2
+          remote_src: true
+
+      - name: resize bootstrap vm disk file
+        shell: |
+          qemu-img resize /var/lib/libvirt/images/rhhi-bootstrap-0-disk1.qcow2 50G
+
+      - name: power off the rhhi-bootstrap-0 VM
+        shell: |
+            virsh destroy rhhi-bootstrap-0
+            virsh undefine rhhi-bootstrap-0
+
+      - name: generate bootstrap vm xml
+        shell: |
+          virt-install --connect qemu:///system \
+                       --import \
+                       --name rhhi-bootstrap-0 \
+                       --ram 4096 --vcpus 4 \
+                       --os-type=linux \
+                       --os-variant=virtio26 \
+                       --disk path=/var/lib/libvirt/images/rhhi-bootstrap-0-disk1.qcow2,format=qcow2,bus=virtio \
+                       --vnc --noautoconsole \
+                       --network network=management --network network=data \
+                       --print-xml > ~/rhhi-bootstrap-0.xml
+
+      - name: adjust bootstrap vm xml for ignition files
+        shell: |
+            sed -i 's|type="kvm"|type="kvm" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0"|' ~/rhhi-bootstrap-0.xml
+            sed -i "/<\/devices>/a <qemu:commandline>\n  <qemu:arg value='-fw_cfg'/>\n  <qemu:arg value='name=opt/com.coreos/config,file=/var/lib/libvirt/images/bootstrap.ign'/>\n</qemu:commandline>" ~/rhhi-bootstrap-0.xml
+
+      - name: define and start bootstrap VM
+        shell: |
+            virsh define ~/rhhi-bootstrap-0.xml  
+            virsh start rhhi-bootstrap-0
+   
+      - name: register bootstrap VM address
+        shell: |
+            virsh domifaddr rhhi-bootstrap-0 | awk '/vnet/ {print $4}' | grep -o '^[^/]*'
+        register: bootstrapaddr
+        until: "'10.0.0' in bootstrapaddr.stdout"
+        retries: 20
+        delay: 15
+
+      - name: wait for bootstrap VM to boot
+        shell: |
+            ssh -o "StrictHostKeyChecking=no" core@{{ bootstrapaddr.stdout }} whoami
+        register: coreuser
+        until: "'core' in coreuser.stdout"
+        retries: 20
+        delay: 15
+
+      - name: addn-host in /etc/NetworkManager/dnsmasq.d/openshift.conf
+        lineinfile:
+          create: yes
+          dest: /etc/NetworkManager/dnsmasq.d/openshift.conf
+          line: "addn-hosts=/etc/hosts.openshift"
+          state: present
+
+      - name: srv-host in /etc/NetworkManager/dnsmasq.d/openshift.conf
+        lineinfile:
+          dest: /etc/NetworkManager/dnsmasq.d/openshift.conf
+          line: "srv-host=_etcd-server-ssl._tcp.rhhi.redhat.local,rhhi-etcd-0.redhat.local,2380,0,0"
+          state: present
+
+      - name: generate /etc/hosts.openshift
+        template:
+          src: openshift_hosts.j2
+          dest: /etc/hosts.openshift
+
+      - name: generate /etc/NetworkManager/conf.d/dnsmasq.conf
+        copy:
+          content: |
+            [main]
+            dns=dnsmasq
+          dest: /etc/NetworkManager/conf.d/dnsmasq.conf
+
+      - name: restart NetworkManager
+        service:
+          name: NetworkManager
+          state: restarted
+
+      - name: add hosts to host list
+        add_host:
+            name: "rhhi-bootstrap-0"
+            groups: "rhhi_bootstrap"
+            ansible_user: "core"
+            ansible_ssh_pass: ""
+            ansible_host: "{{ bootstrapaddr.stdout }}"
+            ansible_ssh_private_key_file: "{{ inventory_dir }}/id_rsa"
+
+- name: update inventory file
+  hosts: localhost
+  gather_facts: no
+  tags: always
+  roles:
+      - role: inventory-update
+        inventory_file_name: 'hosts-install'
+
+- name: Run manual operations on bootstrap VM
+  hosts: rhhi-bootstrap-0
+  gather_facts: no
+  become: true
+  tasks:
+      - name: check if 'Wired connection 1' exists
+        shell: |
+            nmcli con | grep 'Wired connection 1'
+        register: wirecon
+        failed_when: false
+
+      - name: set up network interface script
+        shell: |
+            nmcli con delete 'Wired connection 1'
+        when: wirecon.rc == 0
+
+      - name: set up network eth1 interface script
+        copy:
+            content: |
+              DEVICE=eth1
+              ONBOOT=yes
+              TYPE=Ethernet
+              BOOTPROTO=static
+              IPADDR=172.22.0.1
+              NETMASK=255.255.255.0
+            dest: /etc/sysconfig/network-scripts/ifcfg-eth1
+
+      - name: restart NetworkManager
+        service:
+          name: NetworkManager
+          state: restarted
+
+      - name: masquare eth1 net
+        shell: |
+            iptables -A POSTROUTING -s 172.22.0.0/24 -d 172.22.0.0/24 -m state --state NEW,RELATED,ESTABLISHED -m comment --comment "return src 172.22.0.0/24 dest 172.22.0.0/24 ipv4" -j RETURN -t nat
+            iptables -A POSTROUTING -s 172.22.0.0/24 -m state --state NEW,RELATED,ESTABLISHED -m comment --comment "masquerade 172.22.0.0/24 ipv4" -j MASQUERADE -t nat
+
+      - name: modprobe iscsi_tcp
+        shell: "modprobe iscsi_tcp"
+
+      - name: create httpd dir
+        file:
+            path: /run/httpd
+            state: directory
+
+      - name: create ironic container dir
+        file:
+            path: /root/ironic/
+            state: directory
+
+      - name: create runironic.sh script
+        template:
+            dest: /root/ironic/runironic.sh
+            src: runironic.sh
+
+      - name: get information about vm's from hypervisor
+        vars:
+            vm_nodes: "{{ groups.get('overcloud_nodes', []) }}"
+        delegate_to: hypervisor
+        shell: |
+            NODE_XML=`virsh dumpxml {{ item }}`
+            echo "{
+                'name': '{{ item }}',
+                'mac': '`echo "$NODE_XML" | grep data -B 1 | grep mac | cut -d\' -f2`',
+            }"
+        with_items: "{{ vm_nodes|sort }}"
+        register: nodes_info
+
+      - name: create runironic.sh script
+        template:
+            dest: /root/ironic/dnsmasq.conf
+            src: dnsmasq.conf
+
+      - name: create ironic Dockerfile
+        template:
+            dest: /root/ironic/Dockerfile
+            src: ironicDockerfile
+
+      - name: build ironic container image
+        vars:
+            rhcos_image_url: "https://releases-rhcos.svc.ci.openshift.org/storage/releases/maipo/"
+            rhcos_image_version: "47.284"
+            rhcos_image_filename_openstack: "redhat-coreos-maipo-47.284-openstack.qcow2"
+        shell: |
+            podman build \
+            --build-arg RHCOS_IMAGE_URL={{ rhcos_image_url }} \
+            --build-arg RHCOS_IMAGE_VERSION={{ rhcos_image_version }} \
+            --build-arg RHCOS_IMAGE_FILENAME_OPENSTACK={{ rhcos_image_filename_openstack }} \
+            -t ironic:latest .
+        args:
+            chdir: /root/ironic/
+
+      - name: start ironic container
+        shell: |
+            podman run \
+            -d --net host --privileged --name ironic -v /run:/run:shared -v /dev:/dev localhost/ironic
+
+- name: Install client
+  hosts: rhhi-client-0
+  become: true
+  tasks:
+      - include_role:
+          name: rhos-release
+        vars:
+          director_build: "{{ install.get('director', {}).build|default(omit) }}"
+          build: "{{ install.build | default(omit) }}"
+          mirror: "{{ install.mirror | default(omit) }}"
+          rr_distro_version: "{{ install.osrelease|default(omit) }}"
+          rhos_release_rpm: "https://url.corp.redhat.com/rhos-release-latest-rpm"
+          release: "14"
+          rr_buildmods: "pin"
+
+      - name: install ironic client
+        package:
+          name: "{{ item }}"
+          state: installed
+        with_items:
+          - 'python2-openstackclient'
+          - 'python2-ironicclient'
+          - 'genisoimage'
+          - 'jq'
+
+      - name: create configdrive
+        file:
+            path: /root/configdrive/openstack/latest
+            state: directory
+            recurse: true
+
+      - name: copy master ignition files
+        fetch: 
+            src: /opt/go/src/github.com/openshift/installer/rhhi/master.ign 
+            dest: ./master.ign
+            flat: yes
+        delegate_to: hypervisor
+
+      - name: copy master ignition files
+        copy: 
+            src: ./master.ign
+            dest: /root/configdrive/openstack/latest/user_data
+
+      - setup:
+        delegate_to: rhhi-bootstrap-0
+
+      - name: add rhhi-api to hosts
+        lineinfile:
+          dest: /etc/hosts
+          line: "{{ hostvars['rhhi-bootstrap-0']['ansible_host'] }} rhhi-api.redhat.local" 
+          state: present
+
+      - name: register ironic nodes
+        shell: |
+            export OS_TOKEN=fake-token
+            export OS_URL=http://rhhi-api.redhat.local:6385/
+            openstack baremetal create nodes.json
+
+      - name: deploy ironic nodes
+        shell: |
+            export OS_TOKEN=fake-token
+            export OS_URL=http://rhhi-api.redhat.local:6385/
+            openstack baremetal node set {{ item }} --instance-info image_source=http://172.22.0.1/images/redhat-coreos-maipo-47.284-openstack.qcow2 --instance-info image_checksum=2a38fafe0b9465937955e4d054b8db3a --instance-info root_gb=50 --property root_device='{"name": "/dev/vda"}'
+            openstack baremetal node manage {{ item }} --wait
+            openstack baremetal node provide {{ item }} --wait
+            openstack baremetal node deploy --config-drive configdrive {{ item }}
+        with_items: "{{ groups['rhhi_master'] }}"
+
+      - name: wait for the ironic nodes to get deployed
+        shell: |
+            export OS_TOKEN=fake-token
+            export OS_URL=http://rhhi-api.redhat.local:6385/
+            openstack baremetal node show {{ item }} -f json | jq -r -c .provision_state
+        with_items: "{{ groups['rhhi_master'] }}"
+        register: isdeployed
+        until: "'active' in isdeployed.stdout"
+        retries: 20
+        delay: 30

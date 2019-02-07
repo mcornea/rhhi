@@ -1,0 +1,31 @@
+{
+  "nodes": [
+{% for host_string in nodes_info.results|map(attribute='stdout')|list %}
+{% set host_data = host_string|from_yaml %}
+    {
+      "name": "{{ host_data.name }}",
+      "driver": "ipmi",
+      "resource_class": "baremetal",
+      "driver_info": {
+        "ipmi_username": "{{ install.vbmc.username }}",
+        "ipmi_password": "{{ install.vbmc.password }}",
+        "ipmi_address": "{{ vbmc_management_address }}",
+        "ipmi_port": "{{ vbmc_ports[host_data.name] }}",
+        "deploy_kernel": "http://172.22.0.1/images/tinyipa-stable-rocky.vmlinuz",
+        "deploy_ramdisk": "http://172.22.0.1/images/tinyipa-stable-rocky.gz"
+      },
+      "ports": [{
+        "address": "{{ host_data.mac }}",
+        "pxe_enabled": true
+      }],
+      "properties": {
+        "local_gb": "{{ (host_data.disk_bytes|int / 1073741824)|round|int }}",
+        "cpu_arch": "{{ host_data.arch }}"
+      }
+    }
+    {% if not loop.last %}
+    ,
+    {% endif %}
+  {% endfor %}
+  ]
+}
