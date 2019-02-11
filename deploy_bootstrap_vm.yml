@@ -1,0 +1,136 @@
+#
+# This file is based on steps from metal-kube scripts:
+# https://github.com/metalkube/dev-scripts/blob/master/05_deploy_bootstrap_vm.sh
+#
+---
+- name: register public ssh key
+  command: cat /root/.ssh/id_rsa.pub
+  register: pubkey
+
+- name: generate install-config
+  # The install config contains the main parameters for the installation process.
+  # This configuration provides the user with more options than the interactive
+  #   prompts and comes pre-populated with default values
+  template:
+    src: install-config.yaml.j2
+    dest: /opt/go/src/github.com/openshift/installer/rhhi/install-config.yaml
+
+- name: generate ignition configs
+  # These are the three Ignition Configs for the bootstrap, master, and worker machines
+  shell: |
+    export GOPATH=/opt/go
+    export PATH=$PATH:${GOPATH//://bin:}/bin
+    bin/openshift-install --dir rhhi --log-level=debug create ignition-configs
+  args:
+    chdir: /opt/go/src/github.com/openshift/installer
+
+- name: copy bootstrap ignition config
+  copy:
+    src: /opt/go/src/github.com/openshift/installer/rhhi/bootstrap.ign
+    dest: /var/lib/libvirt/images/bootstrap.ign
+    remote_src: true
+
+- name: check if coreos image was downloaded
+  stat:
+    path: /var/lib/libvirt/images/redhat-coreos-maipo-47.284-qemu.qcow2
+  register: coreosimage
+
+- name: download coreos image
+  shell: |
+    curl --insecure --compressed -L \
+      -o /var/lib/libvirt/images/redhat-coreos-maipo-47.284-qemu.qcow2 \
+      https://releases-redhat-coreos-dev.cloud.paas.upshift.redhat.com/storage/releases/maipo/47.284/redhat-coreos-maipo-47.284-qemu.qcow2.gz
+  when: not coreosimage.stat.exists
+
+- name: copy bootstrap vm disk file
+  copy:
+    src: /var/lib/libvirt/images/redhat-coreos-maipo-47.284-qemu.qcow2
+    dest: /var/lib/libvirt/images/rhhi-bootstrap-0-disk1.qcow2
+    remote_src: true
+
+- name: resize bootstrap vm disk file
+  shell: |
+    qemu-img resize /var/lib/libvirt/images/rhhi-bootstrap-0-disk1.qcow2 50G
+
+- name: power off the rhhi-bootstrap-0 VM
+  shell: |
+      virsh destroy rhhi-bootstrap-0
+      virsh undefine rhhi-bootstrap-0
+
+- name: generate bootstrap vm xml
+  shell: |
+    virt-install --connect qemu:///system \
+      --import \
+      --name rhhi-bootstrap-0 \
+      --ram 4096 --vcpus 4 \
+      --os-type=linux \
+      --os-variant=virtio26 \
+      --disk path=/var/lib/libvirt/images/rhhi-bootstrap-0-disk1.qcow2,format=qcow2,bus=virtio \
+      --vnc --noautoconsole \
+      --network network=management --network network=data \
+      --print-xml > ~/rhhi-bootstrap-0.xml
+
+- name: adjust bootstrap vm xml for ignition files
+  shell: |
+    sed -i 's|type="kvm"|type="kvm" xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0"|' ~/rhhi-bootstrap-0.xml
+    sed -i "/<\/devices>/a <qemu:commandline>\n  <qemu:arg value='-fw_cfg'/>\n  <qemu:arg value='name=opt/com.coreos/config,file=/var/lib/libvirt/images/bootstrap.ign'/>\n</qemu:commandline>" ~/rhhi-bootstrap-0.xml
+
+- name: define and start bootstrap VM
+  shell: |
+    virsh define ~/rhhi-bootstrap-0.xml
+    virsh start rhhi-bootstrap-0
+
+- name: register bootstrap VM address
+  shell: |
+    virsh domifaddr rhhi-bootstrap-0 | awk '/vnet/ {print $4}' | grep -o '^[^/]*'
+  register: bootstrapaddr
+  until: "'10.0.0' in bootstrapaddr.stdout"
+  retries: 20
+  delay: 15
+
+- name: wait for bootstrap VM to boot
+  shell: |
+    ssh -o "StrictHostKeyChecking=no" core@{{ bootstrapaddr.stdout }} whoami
+  register: coreuser
+  until: "'core' in coreuser.stdout"
+  retries: 20
+  delay: 15
+
+- name: addn-host in /etc/NetworkManager/dnsmasq.d/openshift.conf
+  lineinfile:
+    create: yes
+    dest: /etc/NetworkManager/dnsmasq.d/openshift.conf
+    line: "addn-hosts=/etc/hosts.openshift"
+    state: present
+
+- name: srv-host in /etc/NetworkManager/dnsmasq.d/openshift.conf
+  lineinfile:
+    dest: /etc/NetworkManager/dnsmasq.d/openshift.conf
+    line: "srv-host=_etcd-server-ssl._tcp.rhhi.redhat.local,rhhi-etcd-0.redhat.local,2380,0,0"
+    state: present
+
+- name: generate /etc/hosts.openshift
+  template:
+    src: openshift_hosts.j2
+    dest: /etc/hosts.openshift
+
+- name: generate /etc/NetworkManager/conf.d/dnsmasq.conf
+  copy:
+    content: |
+      [main]
+      dns=dnsmasq
+    dest: /etc/NetworkManager/conf.d/dnsmasq.conf
+
+- name: restart NetworkManager
+  service:
+    name: NetworkManager
+    state: restarted
+
+- name: add hosts to host list
+  add_host:
+    name: "rhhi-bootstrap-0"
+    groups: "rhhi_bootstrap"
+    ansible_user: "core"
+    ansible_ssh_pass: ""
+    ansible_host: "{{ bootstrapaddr.stdout }}"
+    ansible_ssh_private_key_file: "{{ inventory_dir }}/id_rsa"
