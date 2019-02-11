@@ -1,0 +1,51 @@
+---
+- name: check go directory exists
+  stat:
+    path: /opt/go/
+  register: godir
+
+- block:
+    # TODO: it should be a installer's dependency
+    #     : so when in place switch to package manager
+    - name: get GO lang source
+      vars:
+        go_src_url: https://dl.google.com/go/go1.10.8.linux-amd64.tar.gz
+      get_url:
+        url: "{{ go_src_url }}"
+        dest: /opt/go.tar.gz
+        force: true
+
+    - name: unpack GO lang archive
+      unarchive:
+        src: /opt/go.tar.gz
+        dest: /opt/
+        remote_src: true
+
+    - name: create installer base dir
+      file:
+        path: /opt/go/src/github.com/openshift/installer
+        state: directory
+
+    - name: download openshift installer
+      git:
+        repo: https://github.com/openshift/installer.git
+        dest: /opt/go/src/github.com/openshift/installer
+  when: not godir.stat.exists
+
+- name: build dependencies
+  shell: |
+    export GOPATH=/opt/go
+    export PATH=$PATH:${GOPATH//://bin:}/bin
+    TAGS=libvirt hack/build.sh
+  args:
+    chdir: /opt/go/src/github.com/openshift/installer
+
+- name: remove deployment dir installer/rhhi
+  file:
+    path: /opt/go/src/github.com/openshift/installer/rhhi
+    state: absent
+
+- name: create deployment dir installer/rhhi
+  file:
+    path: /opt/go/src/github.com/openshift/installer/rhhi
+    state: directory

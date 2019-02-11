@@ -8,44 +8,10 @@
         tags:
           - vbmc
 
-      - name: check if coreos image was downloaded
-        stat:
-          path: /opt/go/
-        register: godir
-
-      - block:
-          - name: download golang
-            shell: |
-                curl -o /opt/go.tar.gz https://dl.google.com/go/go1.10.8.linux-amd64.tar.gz
-                tar xvf go.tar.gz
-            args:
-                chdir: /opt/
-
-          - file:
-                path: /opt/go/src/github.com/openshift/installer
-                state: directory
-
-          - name: download openshift installer
-            git:
-                repo: https://github.com/openshift/installer.git
-                dest: /opt/go/src/github.com/openshift/installer
-        when: not godir.stat.exists 
-
       - name: build dependencies
-        shell: |
-            export GOPATH=/opt/go
-            export PATH=$PATH:${GOPATH//://bin:}/bin
-            TAGS=libvirt hack/build.sh
-        args:
-            chdir: /opt/go/src/github.com/openshift/installer
-
-      - file:
-            path: /opt/go/src/github.com/openshift/installer/rhhi
-            state: absent
-
-      - file:
-            path: /opt/go/src/github.com/openshift/installer/rhhi
-            state: directory
+        import_tasks: setup_dependencies.yml
+        tags:
+          - setup_build_dep
 
       - name: register public ssh key
         command: cat /root/.ssh/id_rsa.pub
